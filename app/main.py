@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import iterate_in_threadpool
 
 from . import __version__, db, service
 from .parsing import InputError
@@ -185,6 +186,11 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 if published
                 else []
             )
+            review_run = service.current_review_run(c, batch)
+            review_rows = service.list_review_rows(c, int(review_run["id"])) if review_run else []
+            review = service.review_progress(c, int(review_run["id"])) if review_run else None
+            decision_counts = service.decision_counts_by_run(c, batch_id)
+            history = service.historical_decisions(c, batch_id)
             pending = service.is_run_active(c, batch_id)
         return render(
             request,
@@ -193,6 +199,11 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 "batch": batch,
                 "active_map": active_map,
                 "published": published,
+                "review_run": review_run,
+                "review_rows": review_rows,
+                "review": review,
+                "decision_counts": decision_counts,
+                "history": history,
                 "runs": runs,
                 "counts": counts,
                 "preview": preview,
@@ -203,6 +214,84 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 "per_page": app.state.settings["per_page"],
             },
         )
+
+    @app.post("/batches/{batch_id}/review/{hotspot_seq}")
+    def submit_review(
+        request: Request,
+        batch_id: int,
+        hotspot_seq: int,
+        code: str = Form(""),
+        reason: str = Form(""),
+        revision: str = Form(""),
+        run_id: str = Form(""),
+    ):
+        """Record one reviewer decision (optimistic concurrency via revision)."""
+
+        try:
+            if not run_id.strip():
+                raise service.ServiceError("缺少计算记录号，请刷新页面后重试")
+            expected = int(revision) if revision.strip() else 0
+            service.save_decision(
+                app.state.settings["db_path"],
+                batch_id,
+                int(run_id),
+                hotspot_seq,
+                code,
+                reason,
+                expected,
+            )
+        except service.ReviewConflict as exc:
+            current = exc.current
+            detail = ""
+            if current:
+                detail = (
+                    f"当前裁定为 {current['code']}（版本 r{current['revision']}），"
+                    f"理由：{current['reason']}"
+                )
+            return _redirect(
+                f"/batches/{batch_id}",
+                err=f"保存失败，{exc}。{detail}".strip(),
+                fragment=f"conflict-{hotspot_seq}",
+            )
+        except (service.ServiceError, ValueError) as exc:
+            return _redirect(
+                f"/batches/{batch_id}", err=str(exc), fragment=f"conflict-{hotspot_seq}"
+            )
+        return _redirect(
+            f"/batches/{batch_id}", msg="裁定已保存", fragment=f"conflict-{hotspot_seq}"
+        )
+
+    @app.get("/batches/{batch_id}/download_review.csv")
+    def download_review(batch_id: int):
+        """Download the reviewed detail; refuses until every conflict is decided."""
+
+        try:
+            filename, body = service.begin_reviewed_export(
+                app.state.settings["db_path"], batch_id
+            )
+        except service.ServiceError as exc:
+            return _redirect(f"/batches/{batch_id}", err=str(exc))
+        headers = {
+            "Content-Disposition": (
+                f"attachment; filename=\"{filename}\"; "
+                f"filename*=UTF-8''{quote(filename)}"
+            ),
+            "Cache-Control": "no-store",
+        }
+
+        async def stream():
+            # Close the underlying generator deterministically when the client
+            # disconnects, so the read transaction/connection is released
+            # without waiting for garbage collection.
+            iterator = iterate_in_threadpool(body)
+            try:
+                async for chunk in iterator:
+                    yield chunk
+            finally:
+                await iterator.aclose()
+                body.close()
+
+        return StreamingResponse(stream(), media_type="text/csv; charset=utf-8", headers=headers)
 
     @app.get("/batches/{batch_id}/download.csv")
     def download(batch_id: int):
@@ -234,6 +323,10 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
                 raise HTTPException(status_code=404, detail="热点批次不存在")
             published = service.get_published_run(c, batch)
             runs = service.list_runs(c, batch_id, limit=10)
+            review_run = service.current_review_run(c, batch)
+            review = (
+                service.review_progress(c, int(review_run["id"])) if review_run else None
+            )
         return {
             "batch_id": batch_id,
             "published_run_id": batch["published_run_id"],
@@ -242,6 +335,16 @@ def create_app(db_path: str | None = None, start_worker: bool | None = None) -> 
             "matched": published["matched_count"] if published else None,
             "conflict": published["conflict_count"] if published else None,
             "unmatched": published["unmatched_count"] if published else None,
+            "review": (
+                {
+                    "run_id": int(review_run["id"]),
+                    "conflict_total": review["total"],
+                    "decided": review["decided"],
+                    "complete": review["complete"],
+                }
+                if review is not None
+                else None
+            ),
             "pending": any(
                 run["status"] in (service.STATUS_QUEUED, service.STATUS_RUNNING) for run in runs
             ),
@@ -282,11 +385,15 @@ def _safe_filename(name: str | None, fallback: str) -> str:
     return text or fallback
 
 
-def _redirect(path: str, msg: str | None = None, err: str | None = None) -> RedirectResponse:
+def _redirect(
+    path: str, msg: str | None = None, err: str | None = None, fragment: str | None = None
+) -> RedirectResponse:
     from urllib.parse import urlencode
 
     params = {key: value for key, value in (("msg", msg), ("err", err)) if value}
     url = path + (("?" + urlencode(params)) if params else "")
+    if fragment:
+        url += "#" + fragment
     return RedirectResponse(url, status_code=303)
 
 

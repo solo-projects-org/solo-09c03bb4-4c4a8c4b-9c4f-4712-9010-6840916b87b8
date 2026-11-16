@@ -91,11 +91,32 @@ CREATE TABLE IF NOT EXISTS results (
     codes_json      TEXT NOT NULL,
     PRIMARY KEY (run_id, hotspot_seq)
 );
+
+-- A reviewer's adjudication of one auto-detected conflict.  Decisions are
+-- keyed by run, never by batch: a recomputation produces a new run and must be
+-- reviewed again, while the old decision stays with the computation it was
+-- made against.  ``revision`` is the optimistic-concurrency token: a form
+-- carries the revision it was rendered from and the update only succeeds if
+-- the row still has that revision.
+CREATE TABLE IF NOT EXISTS review_decisions (
+    run_id          INTEGER NOT NULL,
+    hotspot_seq     INTEGER NOT NULL,
+    code            TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 1,
+    decided_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (run_id, hotspot_seq),
+    FOREIGN KEY (run_id, hotspot_seq)
+        REFERENCES results(run_id, hotspot_seq) ON DELETE CASCADE
+);
 """
 
 
-def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+def connect(db_path: str, check_same_thread: bool = True) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        db_path, timeout=30, isolation_level=None, check_same_thread=check_same_thread
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")

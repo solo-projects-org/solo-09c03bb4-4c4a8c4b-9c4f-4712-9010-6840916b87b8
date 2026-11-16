@@ -26,6 +26,7 @@ import logging
 import sqlite3
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,9 +93,62 @@ RESULT_COLUMNS = [
     "计算记录号",
 ]
 
+REVIEW_COLUMNS = [
+    "来源文件",
+    "来源行号",
+    "热点号",
+    "经度",
+    "纬度",
+    "UTC时刻",
+    "自动归属状态",
+    "原因类型",
+    "原因说明",
+    "候选林班号",
+    "自动归属林班号",
+    "裁定林班号",
+    "最终林班号",
+    "裁定理由",
+    "裁定时间",
+    "裁定版本",
+    "林班底图版本",
+    "计算记录号",
+]
+
 
 class ServiceError(RuntimeError):
     pass
+
+
+class ReviewConflict(ServiceError):
+    """A reviewer submitted against an out-of-date decision row."""
+
+    def __init__(self, message: str, current: dict[str, Any] | None):
+        super().__init__(message)
+        self.current = current
+
+
+def _close_quietly(conn: sqlite3.Connection) -> None:
+    try:
+        conn.close()
+    except sqlite3.Error:  # pragma: no cover - closing a dead connection
+        pass
+
+
+class _ConnGuard:
+    """Closes a connection exactly once, even if the export is never consumed.
+
+    ``begin_reviewed_export`` has to open its snapshot before the response
+    starts (to enforce the "all conflicts adjudicated" gate without sending a
+    partial file).  If the streaming body is never iterated — client vanished
+    between the gate and the first chunk — the generator's ``finally`` does not
+    run, so a weakref finalizer closes the connection instead.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._finalizer = weakref.finalize(self, _close_quietly, conn)
+
+    def close(self) -> None:
+        self._finalizer()
 
 
 @dataclass(frozen=True)
@@ -762,6 +816,245 @@ def is_run_active(conn: sqlite3.Connection, batch_id: int) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Conflict review (manual adjudication of auto-detected conflicts)
+# --------------------------------------------------------------------------
+
+
+def current_review_run(
+    conn: sqlite3.Connection, batch: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The published run, but only while it still matches the active map.
+
+    Review is deliberately limited to the computation behind the current map:
+    after a map swap or recompute the old run's decisions stay attached to the
+    old run and are never offered for (or applied to) the new result.
+    """
+
+    published = get_published_run(conn, batch)
+    if published is None:
+        return None
+    active = get_active_map(conn)
+    if active is None or active.id != published["map_version_id"]:
+        return None
+    return published
+
+
+def _decision_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "code": row["decided_code"],
+        "reason": row["decided_reason"],
+        "revision": int(row["revision"]),
+        "decided_at": row["decided_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _stored_decision_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "code": row["code"],
+        "reason": row["reason"],
+        "revision": int(row["revision"]),
+        "decided_at": row["decided_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+_REVIEW_QUERY = """
+    SELECT r.hotspot_seq, h.source_row, h.hotspot_no, h.lon, h.lat, h.observed_at_utc,
+           r.status, r.reason_kind, r.reason, r.codes_json,
+           d.code AS decided_code, d.reason AS decided_reason, d.revision,
+           d.decided_at, d.updated_at
+    FROM results r
+    JOIN runs rr ON rr.id = r.run_id
+    JOIN hotspots h ON h.batch_id = rr.batch_id AND h.seq = r.hotspot_seq
+    LEFT JOIN review_decisions d
+           ON d.run_id = r.run_id AND d.hotspot_seq = r.hotspot_seq
+    WHERE r.run_id = ?
+"""
+
+
+def list_review_rows(conn: sqlite3.Connection, run_id: int) -> list[dict[str, Any]]:
+    """Conflict rows of one run with their candidates and current decision."""
+
+    rows = conn.execute(
+        _REVIEW_QUERY + " AND r.status = ? ORDER BY h.seq", (run_id, CONFLICT)
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["candidates"] = db.load_codes(item.pop("codes_json"))
+        item["decision"] = _decision_dict(row) if row["decided_code"] is not None else None
+        out.append(item)
+    return out
+
+
+def review_progress(conn: sqlite3.Connection, run_id: int) -> dict[str, int | bool]:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               COUNT(d.run_id) AS decided
+        FROM results r
+        LEFT JOIN review_decisions d
+               ON d.run_id = r.run_id AND d.hotspot_seq = r.hotspot_seq
+        WHERE r.run_id = ? AND r.status = ?
+        """,
+        (run_id, CONFLICT),
+    ).fetchone()
+    total = int(row["total"])
+    decided = int(row["decided"])
+    return {"total": total, "decided": decided, "complete": decided == total}
+
+
+def decision_counts_by_run(conn: sqlite3.Connection, batch_id: int) -> dict[int, dict[str, int]]:
+    """Conflict/decided counts for every run of a batch (history view)."""
+
+    rows = conn.execute(
+        """
+        SELECT rr.id AS run_id,
+               COUNT(r.hotspot_seq) AS total,
+               COUNT(d.run_id) AS decided
+        FROM runs rr
+        JOIN results r ON r.run_id = rr.id AND r.status = ?
+        LEFT JOIN review_decisions d
+               ON d.run_id = r.run_id AND d.hotspot_seq = r.hotspot_seq
+        WHERE rr.batch_id = ?
+        GROUP BY rr.id
+        """,
+        (CONFLICT, batch_id),
+    ).fetchall()
+    return {
+        int(row["run_id"]): {"total": int(row["total"]), "decided": int(row["decided"])}
+        for row in rows
+    }
+
+
+def historical_decisions(conn: sqlite3.Connection, batch_id: int) -> list[dict[str, Any]]:
+    """All decisions of a batch, grouped for display with their run/map."""
+
+    rows = conn.execute(
+        """
+        SELECT rr.id AS run_id, rr.map_version_id, m.filename AS map_filename,
+               d.hotspot_seq, d.code, d.reason, d.revision, d.decided_at, d.updated_at,
+               h.source_row, h.hotspot_no
+        FROM review_decisions d
+        JOIN runs rr ON rr.id = d.run_id
+        JOIN map_versions m ON m.id = rr.map_version_id
+        JOIN hotspots h ON h.batch_id = rr.batch_id AND h.seq = d.hotspot_seq
+        WHERE rr.batch_id = ?
+        ORDER BY rr.id DESC, h.seq
+        """,
+        (batch_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _load_conflict_result(
+    conn: sqlite3.Connection, run_id: int, hotspot_seq: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM results WHERE run_id = ? AND hotspot_seq = ?",
+        (run_id, hotspot_seq),
+    ).fetchone()
+
+
+def get_decision(
+    conn: sqlite3.Connection, run_id: int, hotspot_seq: int
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM review_decisions WHERE run_id = ? AND hotspot_seq = ?",
+        (run_id, hotspot_seq),
+    ).fetchone()
+    return _stored_decision_dict(row) if row is not None else None
+
+
+MAX_DECISION_REASON = 1000
+
+
+def save_decision(
+    db_path: str,
+    batch_id: int,
+    run_id: int,
+    hotspot_seq: int,
+    code: str,
+    reason: str,
+    expected_revision: int | None,
+) -> dict[str, Any]:
+    """Record or replace one conflict adjudication.
+
+    ``expected_revision`` is the revision rendered into the reviewer's form (0
+    for "no decision yet").  A submission whose revision no longer matches the
+    stored row loses: it raises :class:`ReviewConflict` instead of overwriting
+    the decision that was committed in between.
+    """
+
+    code = (code or "").strip()
+    reason = (reason or "").strip()
+    if not code:
+        raise ServiceError("请选择一个候选林班")
+    if not reason:
+        raise ServiceError("请填写裁定理由")
+    if len(reason) > MAX_DECISION_REASON:
+        raise ServiceError(f"裁定理由不能超过 {MAX_DECISION_REASON} 字")
+
+    with db.connection(db_path) as conn:
+        with db.write_tx(conn):
+            batch = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+            if batch is None:
+                raise ServiceError("热点批次不存在")
+            run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if run is None or int(run["batch_id"]) != batch_id:
+                raise ServiceError("计算记录不属于该批次")
+            if batch["published_run_id"] != run_id:
+                raise ReviewConflict("该计算记录已不是当前发布结果，请刷新页面后重新裁定", None)
+            active = get_active_map(conn)
+            if active is None or active.id != run["map_version_id"]:
+                raise ReviewConflict("当前底图已更换，请先按当前底图重算后再裁定", None)
+            result = _load_conflict_result(conn, run_id, hotspot_seq)
+            if result is None:
+                raise ServiceError("热点明细不存在")
+            if result["status"] != CONFLICT:
+                raise ServiceError("该热点不是自动归属冲突，无需人工裁定")
+            candidates = db.load_codes(result["codes_json"])
+            if code not in candidates:
+                raise ServiceError("裁定林班必须是该热点的候选林班：" + "、".join(candidates))
+
+            existing = conn.execute(
+                "SELECT * FROM review_decisions WHERE run_id = ? AND hotspot_seq = ?",
+                (run_id, hotspot_seq),
+            ).fetchone()
+            current = _stored_decision_dict(existing) if existing is not None else None
+            wanted = 0 if expected_revision is None else int(expected_revision)
+            actual = current["revision"] if current else 0
+            if wanted != actual:
+                raise ReviewConflict(
+                    "该热点的裁定已被其他审核员修改，本次提交未保存", current
+                )
+
+            now = db.utc_now()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO review_decisions
+                        (run_id, hotspot_seq, code, reason, revision, decided_at, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (run_id, hotspot_seq, code, reason, now, now),
+                )
+            else:
+                updated = conn.execute(
+                    """
+                    UPDATE review_decisions
+                    SET code = ?, reason = ?, revision = revision + 1, updated_at = ?
+                    WHERE run_id = ? AND hotspot_seq = ? AND revision = ?
+                    """,
+                    (code, reason, now, run_id, hotspot_seq, actual),
+                ).rowcount
+                if updated != 1:  # defensive; the write lock already serialises
+                    raise ReviewConflict("该热点的裁定已被其他审核员修改，本次提交未保存", current)
+            return get_decision(conn, run_id, hotspot_seq) or {}
+
+
+# --------------------------------------------------------------------------
 # Export
 # --------------------------------------------------------------------------
 
@@ -841,3 +1134,163 @@ def iter_result_csv(db_path: str, batch_id: int, chunk: int = 1000) -> Iterator[
                 yield drain()
             if buffer.tell():
                 yield drain()
+
+
+def _review_export_target(
+    conn: sqlite3.Connection, batch_id: int
+) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """Resolve the run a reviewed export may be built from, inside a snapshot.
+
+    Only the published run of the currently active map is reviewable/downloadable,
+    so a reviewed file can never mix an old map's computation with new decisions.
+    """
+
+    batch = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if batch is None:
+        raise ServiceError("热点批次不存在")
+    run_id = batch["published_run_id"]
+    if run_id is None:
+        raise ServiceError("该批次还没有可下载的计算结果")
+    run = conn.execute(
+        """
+        SELECT r.*, m.filename AS map_filename, m.id AS map_id
+        FROM runs r JOIN map_versions m ON m.id = r.map_version_id
+        WHERE r.id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if run is None:
+        raise ServiceError("已发布的计算结果不存在")
+    active = conn.execute("SELECT id FROM map_versions WHERE is_active = 1").fetchone()
+    if active is None or int(active["id"]) != int(run["map_version_id"]):
+        raise ServiceError("当前底图已更换，审核版只能针对当前底图的计算结果导出")
+    return batch, run
+
+
+def begin_reviewed_export(
+    db_path: str, batch_id: int, chunk: int = 1000
+) -> tuple[str, Iterator[str]]:
+    """Start a reviewed export, or fail before any response body is sent.
+
+    The completeness check and the rows are read from the same connection in
+    the same read transaction, so the gate ("all conflicts adjudicated") and
+    the produced file always describe the same computation and decisions.
+    """
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+
+    def drain() -> str:
+        value = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        return value
+
+    # The streaming generator may be advanced from different thread-pool
+    # threads; the connection is used strictly sequentially by that generator.
+    conn = db.connect(db_path, check_same_thread=False)
+    guard = _ConnGuard(conn)
+    try:
+        conn.execute("BEGIN")
+        batch, run = _review_export_target(conn, batch_id)
+        run_id = int(run["id"])
+        progress = review_progress(conn, run_id)
+        if not progress["complete"]:
+            raise ServiceError(
+                f"当前计算仍有 {progress['total'] - progress['decided']} 条归属冲突未裁定，"
+                "全部裁定后才能下载审核版"
+            )
+    except BaseException:
+        conn.execute("ROLLBACK")
+        guard.close()
+        raise
+
+    filename = f"hotspot_review_batch{batch_id}_run{run_id}.csv"
+
+    def generate() -> Iterator[str]:
+        # The read transaction stays open for the whole file and is always
+        # released, including when the client disconnects mid-download.
+        try:
+            writer.writerow(REVIEW_COLUMNS)
+            yield "﻿" + drain()
+            yield from _reviewed_body(conn, writer, drain, run_id, chunk)
+        finally:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:  # pragma: no cover - already closed
+                pass
+            finally:
+                guard.close()
+
+    return filename, generate()
+
+
+def _reviewed_body(
+    conn: sqlite3.Connection,
+    writer: Any,
+    drain: Any,
+    run_id: int,
+    chunk: int,
+) -> Iterator[str]:
+    cursor = conn.execute(
+        """
+        SELECT h.source_row, h.hotspot_no, h.lon, h.lat, h.observed_at_utc,
+               r.status, r.reason_kind, r.reason, r.codes_json,
+               d.code AS decided_code, d.reason AS decided_reason,
+               d.revision, d.updated_at,
+               b.filename AS batch_filename,
+               m.filename AS map_filename, m.id AS map_id, rr.id AS run_id
+        FROM results r
+        JOIN runs rr ON rr.id = r.run_id
+        JOIN hotspots h ON h.batch_id = rr.batch_id AND h.seq = r.hotspot_seq
+        JOIN batches b ON b.id = rr.batch_id
+        JOIN map_versions m ON m.id = rr.map_version_id
+        LEFT JOIN review_decisions d
+               ON d.run_id = r.run_id AND d.hotspot_seq = r.hotspot_seq
+        WHERE r.run_id = ?
+        ORDER BY h.seq
+        """,
+        (run_id,),
+    )
+    while True:
+        rows = cursor.fetchmany(chunk)
+        if not rows:
+            break
+        for row in rows:
+            codes = db.load_codes(row["codes_json"])
+            is_conflict = row["status"] == CONFLICT
+            decided = row["decided_code"] if is_conflict else None
+            if is_conflict and not decided:  # guarded above; keep the file honest
+                raise ServiceError("审核版生成期间出现未裁定冲突，请刷新后重试")
+            if decided:
+                final_code = decided
+            elif row["status"] == MATCHED and codes:
+                final_code = codes[0]
+            else:
+                final_code = ""
+            writer.writerow(
+                [
+                    row["batch_filename"],
+                    row["source_row"],
+                    row["hotspot_no"],
+                    f"{row['lon']:.8f}".rstrip("0").rstrip("."),
+                    f"{row['lat']:.8f}".rstrip("0").rstrip("."),
+                    row["observed_at_utc"],
+                    STATUS_LABELS.get(row["status"], row["status"]),
+                    REASON_LABELS.get(row["reason_kind"], row["reason_kind"]),
+                    row["reason"],
+                    ";".join(codes),
+                    codes[0] if (row["status"] == MATCHED and codes) else "",
+                    decided or "",
+                    final_code,
+                    row["decided_reason"] or "",
+                    row["updated_at"] or "",
+                    f"r{row['revision']}" if decided else "",
+                    f"v{row['map_id']} · {row['map_filename']}",
+                    f"run-{row['run_id']}",
+                ]
+            )
+        yield drain()
+
+
+

@@ -165,6 +165,131 @@ def test_two_servers_publish_single_consistent_version(tmp_path):
         server_b.stop()
 
 
+# --------------------------------------------------------------------------
+# Conflict review across two real servers
+# --------------------------------------------------------------------------
+
+
+def _review_page_rows(client: httpx.Client, batch_id: int = 1):
+    """Parse the review forms rendered on the batch page (server-side HTML)."""
+
+    import html as html_module
+    import re as re_module
+
+    page = client.get(f"{client.base_url}/batches/{batch_id}").text
+    rows = []
+    for block in page.split('<div class="review-item"')[1:]:
+        seq = int(re_module.search(r'id="conflict-(\d+)"', block).group(1))
+        run_id = int(re_module.search(r'name="run_id" value="(\d+)"', block).group(1))
+        revision = int(re_module.search(r'name="revision" value="(\d+)"', block).group(1))
+        candidates = re_module.findall(r'<option value="([^"]+)"', block)
+        rows.append(
+            {
+                "seq": seq,
+                "run_id": run_id,
+                "revision": revision,
+                "candidates": [html_module.unescape(item) for item in candidates],
+            }
+        )
+    return rows
+
+
+def _post_decision(client: httpx.Client, row, code, reason, batch_id: int = 1):
+    return client.post(
+        f"{client.base_url}/batches/{batch_id}/review/{row['seq']}",
+        data={
+            "run_id": str(row["run_id"]),
+            "revision": str(row["revision"]),
+            "code": code,
+            "reason": reason,
+        },
+        follow_redirects=False,
+    )
+
+
+@pytest.mark.slow
+def test_two_servers_review_workflow(tmp_path):
+    """Adjudications, optimistic conflicts and the reviewed file span processes."""
+
+    db_path = tmp_path / "forest.db"
+    port_a, port_b = free_port(), free_port()
+    server_a = Server(db_path, port_a, tmp_path)
+    server_b = Server(db_path, port_b, tmp_path)
+    server_a.wait_ready()
+    server_b.wait_ready()
+    try:
+        with httpx.Client(base_url=server_a.base, timeout=30) as client_a, httpx.Client(
+            base_url=server_b.base, timeout=30
+        ) as client_b:
+            upload_map(client_a, "v1.geojson", (SAMPLES / "compartments_v1.geojson").read_bytes())
+            upload_hotspots(client_b, (SAMPLES / "hotspots.csv").read_bytes())
+            first = wait_published(client_a, 1)
+            assert first["conflict"] == 6
+
+            rows = _review_page_rows(client_b)
+            assert len(rows) == 6
+
+            # Gate holds on the instance that did not do the uploading.
+            blocked = client_b.get(
+                f"{client_b.base_url}/batches/1/download_review.csv", follow_redirects=False
+            )
+            assert blocked.status_code == 303
+            assert "err=" in blocked.headers["location"]
+
+            # Both instances rendered the same revision of the same row.
+            row = rows[0]
+            first_write = _post_decision(client_a, row, row["candidates"][0], "甲实例核实")
+            assert "err=" not in first_write.headers["location"]
+            late_write = _post_decision(client_b, row, row["candidates"][-1], "乙实例核实")
+            assert "err=" in late_write.headers["location"]
+            from urllib.parse import unquote
+
+            assert "已被其他审核员修改" in unquote(late_write.headers["location"])
+
+            # Decide the remaining conflicts from whichever instance renders them.
+            for index, current in enumerate(_review_page_rows(client_b)):
+                if current["seq"] == row["seq"]:
+                    continue
+                response = _post_decision(
+                    client_b,
+                    current,
+                    current["candidates"][0],
+                    f"并发审核 {index}",
+                )
+                assert "err=" not in response.headers["location"], response.headers["location"]
+
+            reviewed = client_a.get(f"{client_a.base_url}/batches/1/download_review.csv")
+            assert reviewed.status_code == 200
+            assert "attachment" in reviewed.headers["content-disposition"]
+            import csv
+            import io
+
+            parsed = list(csv.DictReader(io.StringIO(reviewed.content.decode("utf-8-sig"))))
+            assert len(parsed) == 15
+            assert all(item["计算记录号"] == f"run-{first['published_run_id']}" for item in parsed)
+            conflict_rows = [item for item in parsed if item["自动归属状态"] == "归属冲突"]
+            assert len(conflict_rows) == 6
+            assert all(item["裁定林班号"] and item["裁定理由"] for item in conflict_rows)
+            assert all(item["自动归属状态"] for item in parsed)
+
+            # A recompute on one instance must demand fresh decisions, while the
+            # old ones remain attached to the old run.
+            client_b.post(f"{client_b.base_url}/batches/1/recompute", follow_redirects=False)
+            second = wait_published(client_a, 1)
+            assert second["published_run_id"] != first["published_run_id"]
+            rows_after = _review_page_rows(client_a)
+            assert len(rows_after) == second["conflict"]
+            assert all(item["revision"] == 0 for item in rows_after)
+            assert all(item["run_id"] == second["published_run_id"] for item in rows_after)
+            blocked = client_a.get(
+                f"{client_a.base_url}/batches/1/download_review.csv", follow_redirects=False
+            )
+            assert "err=" in blocked.headers["location"]
+    finally:
+        server_a.stop()
+        server_b.stop()
+
+
 @pytest.mark.slow
 def test_concurrent_map_swaps_leave_exactly_one_active(tmp_path):
     db_path = tmp_path / "forest.db"
